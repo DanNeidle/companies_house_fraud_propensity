@@ -1,0 +1,145 @@
+import requests
+import time
+from companies_house_settings import companies_house_api_key
+
+# sample_companies.py
+# Sample companies from the Companies House snapshot CSV and fetch officers
+
+# active companies only
+# there are 5122606 active companies (from 5642309 total)
+# companies house rate limits imply about 2 weeks to check all of them ()
+
+import os
+import json
+import time
+import random
+from datetime import datetime
+
+import pandas as pd
+import requests
+
+from companies_house_settings import companies_house_api_key
+
+# Constants
+SNAPSHOT_CSV_FILE = "companies_house_data/BasicCompanyDataAsOneFile-2025-05-01.csv"
+OUTPUT_FILE = "overseas_directors_sample.json"
+NUMBER_TO_SAMPLE = 180000 
+CHECKPOINT_INTERVAL = 50
+
+
+def get_officers(company_number):
+    """
+    Fetch all officers (directors and secretaries) for a company, with pagination and retry.
+    Returns two lists: directors, secretaries.
+    """
+    directors = []
+    secretaries = []
+    start_index = 0
+
+    while True:
+        url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers?start_index={start_index}"
+        # Retry once on failure
+        for attempt in range(2):
+            try:
+                resp = requests.get(url, auth=(companies_house_api_key, ""))
+                if resp.status_code == 200:
+                    data = resp.json()
+                    break
+                else:
+                    print(f"HTTP {resp.status_code} for {company_number}, retrying in 5s...")
+                    time.sleep(5)
+            except requests.RequestException as e:
+                print(f"Error fetching officers for {company_number}: {e}, retrying in 5s...")
+                time.sleep(5)
+        else:
+            print(f"Failed to fetch officers for {company_number} after retries.")
+            return directors, secretaries
+
+        items = data.get("items", [])
+        if not items:
+            break
+
+        for officer in items:
+            role = officer.get("officer_role", "").lower()
+            if role == "director":
+                directors.append(officer)
+            elif role == "secretary":
+                secretaries.append(officer)
+
+        start_index += len(items)
+
+    return directors, secretaries
+
+
+def main():
+    # Load or initialize sampled data
+    if os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, "r") as f:
+            saved = json.load(f)
+        sampled_companies = saved.get("sampled_companies", {})
+        metadata = saved.get("metadata", {})
+    else:
+        sampled_companies = {}
+        metadata = {
+            "snapshot_file": SNAPSHOT_CSV_FILE,
+            "number_to_sample": NUMBER_TO_SAMPLE,
+            "started_at": datetime.utcnow().isoformat() + "Z"
+        }
+
+    # Read CSV into DataFrame
+    print("Loading CSV into memory...")
+    df = pd.read_csv(SNAPSHOT_CSV_FILE, dtype=str)
+    df.columns = df.columns.str.strip()
+    df["CompanyNumber"] = df["CompanyNumber"].str.strip()
+
+    # Count and filter to active companies
+    original_count = len(df)
+    df = df[df.get("CompanyStatus", "").str.strip() == "Active"].copy()
+    active_count = len(df)
+    print(f"Filtered to {active_count} active companies (from {original_count} total)")
+
+    # Index by CompanyNumber
+    df.set_index("CompanyNumber", inplace=True)
+
+    # Prepare sampling
+    all_numbers = df.index.tolist()
+
+    # Regenerate sample_ids if sample size changed or not yet set
+    if metadata.get("number_to_sample") != NUMBER_TO_SAMPLE or "sample_ids" not in metadata:
+        sample_ids = random.sample(all_numbers, NUMBER_TO_SAMPLE)
+        metadata["sample_ids"] = sample_ids
+        metadata["number_to_sample"] = NUMBER_TO_SAMPLE
+    else:
+        sample_ids = metadata["sample_ids"]
+
+    # Iterate and fetch officers
+    for idx, company_number in enumerate(sample_ids, start=1):
+        if company_number in sampled_companies:
+            continue
+
+        print(f"Processing {idx}/{NUMBER_TO_SAMPLE}: {company_number}")
+        row = df.loc[company_number].to_dict()
+
+        directors, secretaries = get_officers(company_number)
+
+        sampled_companies[company_number] = {
+            "company_data": row,
+            "directors": directors,
+            "secretaries": secretaries,
+            "fetched_at": datetime.utcnow().isoformat() + "Z"
+        }
+
+        # Checkpoint
+        if idx % CHECKPOINT_INTERVAL == 0:
+            with open(OUTPUT_FILE, "w") as f:
+                json.dump({"metadata": metadata, "sampled_companies": sampled_companies}, f)
+            print(f"Checkpoint saved at {idx} companies.")
+
+    # Final save
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump({"metadata": metadata, "sampled_companies": sampled_companies}, f)
+    print("Sampling complete.")
+
+
+if __name__ == "__main__":
+    main()
